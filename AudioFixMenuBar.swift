@@ -3,58 +3,155 @@ import Cocoa
 // ─────────────────────────────────────────────────────────────
 // AudioFixMenuBar — Menu bar toggle for USB-C audio refresh
 //
-// Shows a speaker icon in the menu bar. Click to toggle on/off.
-//   🔊 (green dot)  = Active — refreshing audio every 2 minutes
-//   🔇 (red dot)    = Paused — doing nothing
-//
 // Compile:
 //   swiftc -o AudioFixMenuBar AudioFixMenuBar.swift -framework Cocoa
 //
 // Run:
 //   ./AudioFixMenuBar
-//
-// Or move to /Applications and add to Login Items for auto-start.
 // ─────────────────────────────────────────────────────────────
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+
     var statusItem: NSStatusItem!
     var timer: Timer?
     var isActive = true
 
-    // ── Configuration ──
-    let refreshIntervalSeconds: TimeInterval = 120  // 2 minutes
-    let scriptPath: String = NSHomeDirectory() + "/code/_audio/mac-audioBugNuke/fix-usbc-audio-refresh.sh"
-    let skipDevices = ["Minifuse", "MiniFuse", "MINIFUSE"]
-    let targetDevice = "USB PnP Sound Device"  // ONLY refresh this device
+    // ── Persisted settings ──
+    var refreshIntervalSeconds: TimeInterval = 120   // how often to refresh
+    var switchDelayMs: Int = 20                      // how long the switch holds on internal
+
+    let skipDevices    = ["Minifuse", "MiniFuse", "MINIFUSE"]
     let internalPrefix = "Mac"
 
+    // UserDefaults keys
+    let keyEnabledDevices  = "AudioFix.enabledDevices"
+    let keyRefreshInterval = "AudioFix.refreshInterval"
+    let keySwitchDelay     = "AudioFix.switchDelayMs"
+
+    var enabledDevices: Set<String> = []
+
+    // Preset options shown in the menu
+    let refreshOptions: [(label: String, seconds: TimeInterval)] = [
+        ("30 seconds",  30),
+        ("1 minute",    60),
+        ("2 minutes",  120),
+        ("3 minutes",  180),
+        ("5 minutes",  300),
+        ("10 minutes", 600),
+    ]
+    let switchSpeedOptions: [(label: String, ms: Int)] = [
+        ("10 ms",  10),
+        ("20 ms",  20),
+        ("50 ms",  50),
+        ("100 ms", 100),
+    ]
+
+    // ─────────────────────────────────────────────────────────
+    // MARK: Launch
+    // ─────────────────────────────────────────────────────────
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let d = UserDefaults.standard
+
+        // Load enabled devices (default: empty — user picks on first run)
+        if let saved = d.array(forKey: keyEnabledDevices) as? [String], !saved.isEmpty {
+            enabledDevices = Set(saved)
+        } else {
+            enabledDevices = []
+        }
+
+        // Load refresh interval
+        let savedInterval = d.double(forKey: keyRefreshInterval)
+        if savedInterval > 0 { refreshIntervalSeconds = savedInterval }
+
+        // Load switch delay
+        let savedDelay = d.integer(forKey: keySwitchDelay)
+        if savedDelay > 0 { switchDelayMs = savedDelay }
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
-        updateIcon()
+        // Order matters: build menu first so tag lookups in updateIcon() work
         buildMenu()
-        startTimer()  // auto-start ON at launch
+        updateIcon()
+        startTimer()
     }
+
+    // ─────────────────────────────────────────────────────────
+    // MARK: Persistence
+    // ─────────────────────────────────────────────────────────
+
+    func saveEnabledDevices() {
+        UserDefaults.standard.set(Array(enabledDevices), forKey: keyEnabledDevices)
+    }
+
+    func saveSettings() {
+        UserDefaults.standard.set(refreshIntervalSeconds, forKey: keyRefreshInterval)
+        UserDefaults.standard.set(switchDelayMs,          forKey: keySwitchDelay)
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // MARK: Menu construction
+    // ─────────────────────────────────────────────────────────
 
     func buildMenu() {
         let menu = NSMenu()
+        menu.delegate = self
 
+        // Toggle on/off
         let toggleItem = NSMenuItem(title: "Toggle Audio Fix", action: #selector(toggleFix), keyEquivalent: "t")
         toggleItem.target = self
         menu.addItem(toggleItem)
 
-        menu.addItem(NSMenuItem.separator())
+        menu.addItem(.separator())
 
-        let statusItem2 = NSMenuItem(title: "Status: OFF", action: nil, keyEquivalent: "")
-        statusItem2.tag = 100
-        menu.addItem(statusItem2)
+        // Status line (tag 100)
+        let statusLine = NSMenuItem(title: "Status: OFF", action: nil, keyEquivalent: "")
+        statusLine.tag = 100
+        menu.addItem(statusLine)
 
-        let deviceItem = NSMenuItem(title: "Current output: checking...", action: nil, keyEquivalent: "")
-        deviceItem.tag = 200
-        menu.addItem(deviceItem)
+        // Current output line (tag 200)
+        let deviceLine = NSMenuItem(title: "Output: checking...", action: nil, keyEquivalent: "")
+        deviceLine.tag = 200
+        menu.addItem(deviceLine)
 
-        menu.addItem(NSMenuItem.separator())
+        menu.addItem(.separator())
 
+        // ── Target Devices submenu (tag 300) ──
+        menu.addItem(makeSubmenuItem(title: "Target Devices", tag: 300))
+
+        // ── Switch Speed submenu (tag 400) ──
+        let speedParent = NSMenuItem(title: "Switch Speed", action: nil, keyEquivalent: "")
+        speedParent.tag = 400
+        let speedSubmenu = NSMenu()
+        speedSubmenu.autoenablesItems = false
+        for opt in switchSpeedOptions {
+            let item = NSMenuItem(title: opt.label, action: #selector(setSwitchSpeed(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = opt.ms as AnyObject
+            item.state = (opt.ms == switchDelayMs) ? .on : .off
+            speedSubmenu.addItem(item)
+        }
+        speedParent.submenu = speedSubmenu
+        menu.addItem(speedParent)
+
+        // ── Refresh Interval submenu (tag 500) ──
+        let intervalParent = NSMenuItem(title: "Refresh Interval", action: nil, keyEquivalent: "")
+        intervalParent.tag = 500
+        let intervalSubmenu = NSMenu()
+        intervalSubmenu.autoenablesItems = false
+        for opt in refreshOptions {
+            let item = NSMenuItem(title: opt.label, action: #selector(setRefreshInterval(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = opt.seconds as AnyObject
+            item.state = (opt.seconds == refreshIntervalSeconds) ? .on : .off
+            intervalSubmenu.addItem(item)
+        }
+        intervalParent.submenu = intervalSubmenu
+        menu.addItem(intervalParent)
+
+        menu.addItem(.separator())
+
+        // Actions
         let refreshNow = NSMenuItem(title: "Refresh Audio Now", action: #selector(runRefreshOnce), keyEquivalent: "r")
         refreshNow.target = self
         menu.addItem(refreshNow)
@@ -63,7 +160,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         nuclearItem.target = self
         menu.addItem(nuclearItem)
 
-        menu.addItem(NSMenuItem.separator())
+        menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "Quit AudioFix", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
@@ -72,61 +169,153 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
+    func makeSubmenuItem(title: String, tag: Int) -> NSMenuItem {
+        let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        parent.tag  = tag
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        parent.submenu = sub
+        return parent
+    }
+
+    // Refresh device list every time menu opens
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshDeviceSubmenu()
+        updateDeviceInfo()
+    }
+
+    func refreshDeviceSubmenu() {
+        guard let menu    = statusItem.menu,
+              let parent  = menu.item(withTag: 300),
+              let submenu = parent.submenu else { return }
+
+        submenu.removeAllItems()
+
+        let external = getAllOutputDevices().filter { dev in
+            !dev.hasPrefix(internalPrefix) &&
+            !skipDevices.contains(where: { dev.localizedCaseInsensitiveContains($0) })
+        }
+
+        if external.isEmpty {
+            let ph = NSMenuItem(title: "No external devices found", action: nil, keyEquivalent: "")
+            ph.isEnabled = false
+            submenu.addItem(ph)
+            return
+        }
+
+        for device in external {
+            let item = NSMenuItem(title: device, action: #selector(toggleDevice(_:)), keyEquivalent: "")
+            item.target = self
+            item.state  = enabledDevices.contains(device) ? .on : .off
+            submenu.addItem(item)
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // MARK: Settings actions
+    // ─────────────────────────────────────────────────────────
+
+    @objc func toggleDevice(_ sender: NSMenuItem) {
+        let device = sender.title
+        if enabledDevices.contains(device) {
+            enabledDevices.remove(device)
+            sender.state = .off
+        } else {
+            enabledDevices.insert(device)
+            sender.state = .on
+        }
+        saveEnabledDevices()
+        updateDeviceInfo()
+    }
+
+    @objc func setSwitchSpeed(_ sender: NSMenuItem) {
+        guard let ms = sender.representedObject as? Int else { return }
+        switchDelayMs = ms
+        saveSettings()
+        // Update checkmarks in the submenu
+        if let submenu = sender.menu {
+            for item in submenu.items { item.state = (item.representedObject as? Int == ms) ? .on : .off }
+        }
+    }
+
+    @objc func setRefreshInterval(_ sender: NSMenuItem) {
+        guard let secs = sender.representedObject as? TimeInterval else { return }
+        refreshIntervalSeconds = secs
+        saveSettings()
+        // Update checkmarks in the submenu
+        if let submenu = sender.menu {
+            for item in submenu.items { item.state = (item.representedObject as? TimeInterval == secs) ? .on : .off }
+        }
+        // Restart the timer on the new interval
+        if isActive { startTimer() }
+        updateIcon()
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // MARK: Icon & status display
+    // ─────────────────────────────────────────────────────────
+
+    @objc func toggleFix() {
+        isActive.toggle()
+        isActive ? startTimer() : stopTimer()
+        updateIcon()
+    }
+
     func updateIcon() {
         if let button = statusItem.button {
-            let symbolName = isActive ? "speaker.wave.2" : "speaker.slash"
-            if let image = NSImage(systemSymbolName: symbolName,
-                                   accessibilityDescription: isActive ? "Audio Fix: ON" : "Audio Fix: OFF") {
-                image.isTemplate = true   // auto-adapts to dark/light menu bar
-                button.image = image
-                button.title = ""
+            let symbol = isActive ? "speaker.wave.2" : "speaker.slash"
+            if let img = NSImage(systemSymbolName: symbol,
+                                 accessibilityDescription: isActive ? "Audio Fix: ON" : "Audio Fix: OFF") {
+                img.isTemplate = true
+                button.image   = img
+                button.title   = ""
             }
         }
-        // Update status text in menu
-        if let menu = statusItem.menu,
-           let statusMenuItem = menu.item(withTag: 100) {
-            statusMenuItem.title = isActive ? "Status: ON — refreshing every \(Int(refreshIntervalSeconds))s" : "Status: OFF"
+        if let menu = statusItem.menu, let line = menu.item(withTag: 100) {
+            if isActive {
+                let intervalLabel = refreshOptions.first(where: { $0.seconds == refreshIntervalSeconds })?.label
+                    ?? "\(Int(refreshIntervalSeconds))s"
+                line.title = "Status: ON — every \(intervalLabel)"
+            } else {
+                line.title = "Status: OFF"
+            }
         }
         updateDeviceInfo()
     }
 
     func updateDeviceInfo() {
         guard let menu = statusItem.menu,
-              let deviceItem = menu.item(withTag: 200) else { return }
+              let line = menu.item(withTag: 200) else { return }
 
-        if let device = getCurrentDevice() {
-            let protected = skipDevices.contains(where: { device.localizedCaseInsensitiveContains($0) })
-            let isTarget = device.localizedCaseInsensitiveContains(targetDevice)
-            if protected {
-                deviceItem.title = "Output: \(device) (protected — won't touch)"
-            } else if device.hasPrefix(internalPrefix) {
-                deviceItem.title = "Output: \(device) (internal — skipping)"
-            } else if isTarget {
-                deviceItem.title = "Output: \(device) ✓ (will refresh)"
-            } else {
-                deviceItem.title = "Output: \(device) (not target — skipping)"
-            }
+        guard let device = getCurrentDevice() else {
+            line.title = "Output: unknown"
+            return
+        }
+
+        let isProtected = skipDevices.contains(where: { device.localizedCaseInsensitiveContains($0) })
+        let isInternal  = device.hasPrefix(internalPrefix)
+        let isEnabled   = enabledDevices.contains(device)
+
+        if isProtected {
+            line.title = "Output: \(device) (protected — skipping)"
+        } else if isInternal {
+            line.title = "Output: \(device) (internal — skipping)"
+        } else if isEnabled {
+            line.title = "Output: \(device) ✓ (will refresh)"
         } else {
-            deviceItem.title = "Output: unknown"
+            line.title = "Output: \(device) (not a target — skipping)"
         }
     }
 
-    @objc func toggleFix() {
-        isActive.toggle()
-        if isActive {
-            startTimer()
-        } else {
-            stopTimer()
-        }
-        updateIcon()
-    }
+    // ─────────────────────────────────────────────────────────
+    // MARK: Timer
+    // ─────────────────────────────────────────────────────────
 
     func startTimer() {
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: refreshIntervalSeconds, repeats: true) { [weak self] _ in
             self?.runRefresh()
         }
-        // Also run immediately on start
         runRefresh()
     }
 
@@ -135,104 +324,119 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         timer = nil
     }
 
-    func getCurrentDevice() -> String? {
-        let task = Process()
-        let pipe = Pipe()
+    // ─────────────────────────────────────────────────────────
+    // MARK: Audio device helpers
+    // ─────────────────────────────────────────────────────────
 
-        // Try common locations for SwitchAudioSource
-        let candidates = ["/opt/homebrew/bin/SwitchAudioSource", "/usr/local/bin/SwitchAudioSource"]
-        var found: String?
-        for c in candidates {
-            if FileManager.default.isExecutableFile(atPath: c) {
-                found = c
-                break
-            }
-        }
-        guard let bin = found else { return nil }
-
-        task.executableURL = URL(fileURLWithPath: bin)
-        task.arguments = ["-c", "-t", "output"]
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        } catch {
-            return nil
-        }
+    func switchAudioBin() -> String? {
+        ["/opt/homebrew/bin/SwitchAudioSource", "/usr/local/bin/SwitchAudioSource"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
+    func getCurrentDevice() -> String? {
+        guard let bin = switchAudioBin() else { return nil }
+        let task = Process(); let pipe = Pipe()
+        task.executableURL = URL(fileURLWithPath: bin)
+        task.arguments     = ["-c", "-t", "output"]
+        task.standardOutput = pipe
+        task.standardError  = FileHandle.nullDevice
+        try? task.run(); task.waitUntilExit()
+        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func getAllOutputDevices() -> [String] {
+        guard let bin = switchAudioBin() else { return [] }
+        let task = Process(); let pipe = Pipe()
+        task.executableURL = URL(fileURLWithPath: bin)
+        task.arguments     = ["-a", "-t", "output"]
+        task.standardOutput = pipe
+        task.standardError  = FileHandle.nullDevice
+        try? task.run(); task.waitUntilExit()
+        return (String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // MARK: Volume helpers (silent mute around the switch)
+    // ─────────────────────────────────────────────────────────
+
+    func getVolumeState() -> (volume: Int, isMuted: Bool) {
+        let task = Process(); let pipe = Pipe()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        task.arguments = ["-e",
+            "set s to get volume settings\nreturn (output volume of s) & \",\" & (output muted of s)"]
+        task.standardOutput = pipe
+        task.standardError  = FileHandle.nullDevice
+        try? task.run(); task.waitUntilExit()
+        let raw   = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let parts = raw.components(separatedBy: ",")
+        return (Int(parts.first ?? "50") ?? 50,
+                parts.last?.lowercased().contains("true") ?? false)
+    }
+
+    func setMuted(_ muted: Bool, volume: Int? = nil) {
+        var script = "set volume output muted \(muted ? "true" : "false")"
+        if let v = volume { script += "\nset volume output volume \(v)" }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        task.arguments     = ["-e", script]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError  = FileHandle.nullDevice
+        try? task.run(); task.waitUntilExit()
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // MARK: Refresh logic
+    // ─────────────────────────────────────────────────────────
+
     func runRefresh() {
-        // Check current device first
         guard let current = getCurrentDevice() else { return }
 
-        // Skip internal audio
         if current.hasPrefix(internalPrefix) { return }
+        if skipDevices.contains(where: { current.localizedCaseInsensitiveContains($0) }) { return }
+        if !enabledDevices.contains(current) { return }
 
-        // Skip protected devices (Minifuse, etc.)
-        for skip in skipDevices {
-            if current.localizedCaseInsensitiveContains(skip) { return }
-        }
-
-        // Only act on the target device
-        if !current.localizedCaseInsensitiveContains(targetDevice) { return }
-
-        // Find SwitchAudioSource
-        let candidates = ["/opt/homebrew/bin/SwitchAudioSource", "/usr/local/bin/SwitchAudioSource"]
-        var bin: String?
-        for c in candidates {
-            if FileManager.default.isExecutableFile(atPath: c) {
-                bin = c
-                break
-            }
-        }
-        guard let switchBin = bin else { return }
-
-        // Get internal device name
-        let listTask = Process()
-        let listPipe = Pipe()
-        listTask.executableURL = URL(fileURLWithPath: switchBin)
-        listTask.arguments = ["-a", "-t", "output"]
-        listTask.standardOutput = listPipe
-        listTask.standardError = FileHandle.nullDevice
+        guard let switchBin      = switchAudioBin(),
+              let internalDevice = getAllOutputDevices().first(where: { $0.hasPrefix(internalPrefix) })
+        else { return }
 
         do {
-            try listTask.run()
-            listTask.waitUntilExit()
-            let data = listPipe.fileHandleForReading.readDataToEndOfFile()
-            let devices = String(data: data, encoding: .utf8)?
-                .components(separatedBy: "\n")
-                .filter { $0.hasPrefix(internalPrefix) } ?? []
+            // Mute so the switch is completely silent
+            let (originalVolume, wasAlreadyMuted) = getVolumeState()
+            if !wasAlreadyMuted {
+                setMuted(true)
+                usleep(5_000)   // 5ms — let mute settle
+            }
 
-            guard let internalDevice = devices.first, !internalDevice.isEmpty else { return }
-
-            // Switch to internal
+            // Switch → internal
             let t1 = Process()
             t1.executableURL = URL(fileURLWithPath: switchBin)
-            t1.arguments = ["-t", "output", "-s", internalDevice]
+            t1.arguments     = ["-t", "output", "-s", internalDevice]
             t1.standardOutput = FileHandle.nullDevice
-            t1.standardError = FileHandle.nullDevice
-            try t1.run()
-            t1.waitUntilExit()
+            t1.standardError  = FileHandle.nullDevice
+            try t1.run(); t1.waitUntilExit()
 
-            // Brief pause
-            usleep(100_000)  // 0.1 seconds
+            // Hold on internal for the user-configured duration
+            usleep(UInt32(switchDelayMs * 1_000))
 
-            // Switch back
+            // Switch → back to original
             let t2 = Process()
             t2.executableURL = URL(fileURLWithPath: switchBin)
-            t2.arguments = ["-t", "output", "-s", current]
+            t2.arguments     = ["-t", "output", "-s", current]
             t2.standardOutput = FileHandle.nullDevice
-            t2.standardError = FileHandle.nullDevice
-            try t2.run()
-            t2.waitUntilExit()
+            t2.standardError  = FileHandle.nullDevice
+            try t2.run(); t2.waitUntilExit()
 
-        } catch {
-            // Silently fail
-        }
+            // Restore volume
+            if !wasAlreadyMuted {
+                usleep(10_000)   // 10ms — let switch complete before unmuting
+                setMuted(false, volume: originalVolume)
+            }
+        } catch { }
 
         updateDeviceInfo()
     }
@@ -242,40 +446,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateDeviceInfo()
     }
 
+    // ─────────────────────────────────────────────────────────
+    // MARK: Nuclear reset
+    // ─────────────────────────────────────────────────────────
+
     @objc func runNuclear() {
         let alert = NSAlert()
-        alert.messageText = "Nuclear Audio Reset"
+        alert.messageText     = "Nuclear Audio Reset"
         alert.informativeText = "This will kill ALL CoreAudio client processes and restart audio daemons. Any apps playing audio will be interrupted.\n\nContinue?"
-        alert.alertStyle = .warning
+        alert.alertStyle      = .warning
         alert.addButton(withTitle: "Reset Audio")
         alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        if alert.runModal() == .alertFirstButtonReturn {
-            let script = NSHomeDirectory() + "/code/_audio/mac-audioBugNuke/fix-usbc-audio-nuclear.sh"
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/bin/bash")
-            task.arguments = [script]
-            task.standardOutput = FileHandle.nullDevice
-            task.standardError = FileHandle.nullDevice
-            do {
-                try task.run()
-            } catch {
-                let errAlert = NSAlert()
-                errAlert.messageText = "Failed to run nuclear reset"
-                errAlert.informativeText = "Make sure \(script) exists and is executable."
-                errAlert.runModal()
-            }
+        let script = NSHomeDirectory() + "/code/_audio/mac-audioBugNuke/fix-usbc-audio-nuclear.sh"
+        let task   = Process()
+        task.executableURL  = URL(fileURLWithPath: "/bin/bash")
+        task.arguments      = [script]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError  = FileHandle.nullDevice
+        do {
+            try task.run()
+        } catch {
+            let err = NSAlert()
+            err.messageText     = "Failed to run nuclear reset"
+            err.informativeText = "Make sure \(script) exists and is executable."
+            err.runModal()
         }
     }
 
-    @objc func quitApp() {
-        NSApp.terminate(nil)
-    }
+    @objc func quitApp() { NSApp.terminate(nil) }
 }
 
 // ── Main ──
-let app = NSApplication.shared
+let app      = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.accessory)  // No dock icon, menu bar only
+app.setActivationPolicy(.accessory)
 app.run()

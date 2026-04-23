@@ -10,16 +10,16 @@ If your USB-C speakers stutter, sound robotic, or drop out every few minutes on 
 
 ## The Problem
 
-On macOS Tahoe 26.x, USB-C speakers using Apple's built-in USB audio class driver experience intermittent audio stuttering, robotic/broken sound, and complete dropouts — typically every 5–30 minutes of use.
+On macOS Tahoe 26.x, USB-C speakers and USB audio devices using Apple's built-in USB audio class driver experience intermittent audio stuttering, robotic/broken sound, and complete dropouts — typically every 5–30 minutes of use.
 
 **Key findings:**
 
 - Audio state gradually degrades over time in CoreAudio **client processes**, not just the `coreaudiod` daemon itself
-- Running `sudo killall coreaudiod` alone does **not** fix it — corrupted state persists in all the apps that have CoreAudio loaded
+- Running `sudo killall coreaudiod` alone does **not** fix it — corrupted state persists in all apps that have CoreAudio loaded
 - Switching your audio output to another device and back temporarily clears the issue (buys you another 10–60 minutes)
 - **Apple has acknowledged the bug.** Senior support advisors confirmed a patch is in development
 - As of macOS 26.4.1 (April 2026), the bug is **still not fixed**
-- Audio interfaces with their own dedicated USB drivers (e.g., Arturia Minifuse4, Scarlett series) are **not affected** — only devices using Apple's generic USB audio class driver
+- Audio interfaces with their own dedicated USB drivers are **not affected** — only devices relying on Apple's generic USB audio class driver
 
 **Triggers that accelerate degradation:**
 - Xcode / iOS Simulator running in the background
@@ -32,21 +32,24 @@ On macOS Tahoe 26.x, USB-C speakers using Apple's built-in USB audio class drive
 
 ## What This Tool Does
 
-Instead of waiting for the stutter to start, it quietly and automatically performs the output-switch trick every 2 minutes — before degradation becomes audible. The switch takes ~100ms and is imperceptible during normal music, video, or gaming playback.
+Instead of waiting for the stutter to start, it quietly and automatically performs the output-switch trick on a timer — before degradation becomes audible. The switch is wrapped in a mute/unmute so it is completely silent and imperceptible.
 
 **Three components:**
 
 | Component | Purpose |
 |-----------|---------|
-| `AudioFixMenuBar` | Native Swift menu bar app — toggle on/off, manual refresh, nuclear reset |
-| `fix-usbc-audio-refresh.sh` | Standalone bash script for the same refresh logic (crон/launchd friendly) |
+| `AudioFixMenuBar` | Native Swift menu bar app — toggle on/off, per-device targeting, manual refresh, nuclear reset |
+| `fix-usbc-audio-refresh.sh` | Standalone bash script for the same refresh logic (cron/launchd friendly) |
 | `fix-usbc-audio-nuclear.sh` | Emergency full reset — kills all CoreAudio clients + restarts all audio daemons |
 
-**Device safety:**
-- ✅ Only acts on: `USB PnP Sound Device` (configurable)
-- 🚫 Never touches: Minifuse / MiniFuse / MINIFUSE (any capitalization)
-- 🚫 Never touches: Internal/built-in speakers (Mac*)
-- 🚫 Never touches: Any other audio device not matching the target
+**Device targeting:**
+
+The menu bar app dynamically lists all your connected external output devices. You choose which ones to protect — the fix only runs when the active output is one you've enabled. Your choices are saved and restored on every launch.
+
+- ✅ Refreshes only devices you explicitly enable in the **Target Devices** menu
+- 🚫 Never touches internal/built-in speakers
+- 🚫 Never touches devices you haven't enabled
+- 🔄 Device list updates live as you plug/unplug hardware — no restart needed
 
 ---
 
@@ -100,11 +103,9 @@ Because the binary is unsigned, macOS will block it on first run. When you see t
 
 This only happens once.
 
-### 4. Enable the fix
+### 4. Turn it on and choose your devices
 
-Click the menu bar icon → **Toggle Audio Fix** to turn it ON.
-
-The icon changes from `speaker.slash` (off) to `speaker.wave.2` (on, refreshing every 2 min).
+The app launches in the **ON** state automatically. Click the menu bar icon and go to **Target Devices** to check which audio devices you want protected. Any device you enable will be silently refreshed on the timer.
 
 ---
 
@@ -129,12 +130,15 @@ Click the menu bar icon to open the menu:
 |-----------|-------------|
 | **Toggle Audio Fix** | Turns auto-refresh ON/OFF (keyboard: `T`) |
 | **Status line** | Shows current state and refresh interval |
-| **Device line** | Shows current output and whether it will be refreshed |
+| **Output line** | Shows current output device and whether it will be refreshed |
+| **Target Devices ▶** | Submenu listing all connected external audio devices — click any to enable/disable it as a refresh target |
 | **Refresh Audio Now** | Runs a one-shot manual refresh immediately (keyboard: `R`) |
 | **Nuclear Reset** | Full CoreAudio + client process kill — use when stutter has already started |
 | **Quit AudioFix** | Exits the app (keyboard: `Q`) |
 
-**When to toggle OFF:** During critical DAW recording/mixing sessions, the ~100ms output switch could theoretically cause a tiny click at the switch point. Toggle off for those sessions, then back on when done.
+**Target Devices** is fully dynamic — the list is rebuilt every time you open the menu by querying your system live, so plugging in a new device or disconnecting one is reflected immediately without restarting the app. Your enabled/disabled choices are saved in `UserDefaults` and restored on every launch.
+
+**When to toggle OFF:** During critical DAW recording or mixing sessions you may prefer to pause the timer. Toggle it back on when done.
 
 ---
 
@@ -156,13 +160,18 @@ The same refresh logic as the menu bar app, as a plain bash script. Run it manua
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SKIP_DEVICES` | `Minifuse\|MiniFuse\|MINIFUSE` | Pipe-separated device names to never touch |
-| `TARGET_DEVICES` | `USB PnP Sound Device` | Pipe-separated device names to target |
+| `SKIP_DEVICES` | *(empty)* | Pipe-separated device names to never touch, e.g. `Scarlett\|Apollo` |
+| `TARGET_DEVICES` | *(empty — targets all external devices)* | Pipe-separated device names to target specifically |
 | `INTERNAL_AUDIO_PREFIX` | `Mac` | Prefix used to identify internal speakers |
 
-Example — target a different device name:
+Example — target only one specific device:
 ```bash
 TARGET_DEVICES="My USB Speakers" bash fix-usbc-audio-refresh.sh
+```
+
+Example — skip your audio interface while targeting everything else:
+```bash
+SKIP_DEVICES="Scarlett|Apollo" bash fix-usbc-audio-refresh.sh
 ```
 
 ### fix-usbc-audio-nuclear.sh
@@ -209,11 +218,11 @@ To make the `renice` persistent, add it to a login script or launchd agent.
 
 ## Audio MIDI Setup Recommendation
 
-Open **Audio MIDI Setup** (Applications → Utilities) and set your USB PnP Sound Device to **48,000 Hz**.
+Open **Audio MIDI Setup** (Applications → Utilities) and set your USB audio device to **48,000 Hz**.
 
 - macOS system audio runs natively at 48 kHz
 - Using 44.1 kHz forces a sample rate conversion, adding CPU load to an already-buggy audio pipeline and making the bug worse
-- 96 kHz is typically not available on USB class audio devices
+- 96 kHz is typically not available on USB audio class devices
 
 ---
 
@@ -256,18 +265,22 @@ See Step 3 of Installation above. Go to System Settings → Privacy & Security �
 
 **The nuclear reset doesn't fix it**
 
-Make sure you're running it with `bash` (not `source` in this case) so it prompts for sudo correctly:
+Make sure you're running it with `bash` (not `source`) so it prompts for sudo correctly:
 ```bash
 bash ~/code/_audio/mac-audioBugNuke/fix-usbc-audio-nuclear.sh
 ```
 
-**My device name isn't "USB PnP Sound Device"**
+**My device doesn't appear in the Target Devices list**
 
-Find your device's exact name:
+Only external, non-internal devices appear in the list. Run the following to see exactly how your system reports your device names:
 ```bash
 SwitchAudioSource -a -t output
 ```
-Then set the `TARGET_DEVICES` environment variable before running the script, or edit the `targetDevice` constant in `AudioFixMenuBar.swift` and recompile.
+The name shown there is exactly what will appear in the Target Devices menu.
+
+**The fix runs but I still hear stutter**
+
+Try reducing the refresh interval. Edit `AudioFixMenuBar.swift`, change `refreshIntervalSeconds` from `120` to `60` (or lower), and recompile. Some systems degrade faster than others.
 
 ---
 
@@ -313,10 +326,10 @@ This tool is built on community-discovered workarounds. Thanks to everyone who d
 
 PRs welcome. Especially useful:
 
-- Support for other affected device names / device-name detection improvements
 - A proper `.app` bundle with code signing so Gatekeeper stops complaining
 - A launchd plist installer as an alternative to the Login Items approach
 - Testing on Intel Macs (developed and tested on Apple Silicon)
+- Configurable refresh interval via the menu (without recompiling)
 
 ---
 
